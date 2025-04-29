@@ -23,6 +23,9 @@ import numpy as np
 import easyocr
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from pydantic import BaseModel
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # ─── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -54,6 +57,13 @@ app = FastAPI(
 )
 
 # ─── Helper: preprocessing ─────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "https://portal.gioblu.it"],
+    allow_credentials=True,
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+)
 
 
 def preprocess_gray(
