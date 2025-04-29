@@ -39,6 +39,8 @@ import easyocr
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 
+import logging
+
 # Inizializza il reader EasyOCR (solo CPU)
 reader = easyocr.Reader(['en'], gpu=False)
 
