@@ -100,6 +100,15 @@ def find_plate_region(gray: np.ndarray, min_area: int = 1000, ar_range: Tuple[fl
         closed = cv2.Canny(gray, 50, 150)
     cnts, _ = cv2.findContours(
         closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Rileva aree blu (tipiche delle targhe italiane) per aiutare il crop
+    hsv = cv2.cvtColor(cv2.cvtColor(
+        gray, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2HSV)
+    lower_blue = np.array([90, 50, 50])
+    upper_blue = np.array([140, 255, 255])
+    blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+    if cv2.countNonZero(blue_mask) > 100:
+        logger.info(
+            "[plate] Area blu rilevata nella scena, probabilmente targa")
     boxes = []
     for cnt in cnts:
         area = cv2.contourArea(cnt)
