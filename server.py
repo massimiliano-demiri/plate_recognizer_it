@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ANPR Server per targhe italiane (versione intelligente)
---------------------------------------------------------
+ANPR Server per targhe italiane (versione avanzata con debug)
+-------------------------------------------------------------
 
 Espone un’API REST che riceve immagini via POST e risponde
-con la targa riconosciuta, la confidenza e la bounding box.
+con la targa riconosciuta, la confidenza, la bounding box e i tentativi OCR.
 
 Dipendenze:
     pip install fastapi uvicorn easyocr opencv-python-headless numpy pydantic python-multipart
@@ -16,7 +16,7 @@ Esempio di utilizzo:
 import logging
 import re
 import time
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 import cv2
 import numpy as np
@@ -47,13 +47,14 @@ class PlateResponse(BaseModel):
     plate: Optional[str]
     confidence: float
     box: Optional[List[int]]
+    attempts: List[Dict[str, str]]
 
 
 # FastAPI app
 app = FastAPI(
     title="ANPR Server Italiano",
-    description="Riconoscimento targhe italiane intelligente in locale",
-    version="1.4"
+    description="Riconoscimento targhe italiane avanzato in locale",
+    version="1.5"
 )
 
 # CORS
@@ -123,7 +124,7 @@ def normalize_plate(plate: str) -> str:
     return plate.replace("0", "O").replace("1", "I")
 
 
-def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float]:
+def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float, List[Dict[str, str]]]:
     h, w = crop.shape[:2]
     scaled = cv2.resize(crop, (w * UPSCALE_FACTOR, h *
                         UPSCALE_FACTOR), interpolation=cv2.INTER_CUBIC)
@@ -134,25 +135,31 @@ def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float]:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
-    inputs = [binarized, inverted, enhanced]
+    inputs = [("binarized", binarized),
+              ("inverted", inverted), ("enhanced", enhanced)]
     candidates: List[Tuple[str, float]] = []
+    attempts: List[Dict[str, str]] = []
 
-    for img in inputs:
+    for label, img in inputs:
         try:
             results = reader.readtext(img, detail=1)
             for _, text, conf in results:
+                raw = text
                 plate = re.sub(r'[^A-Za-z0-9]', '', text).upper()
                 plate = normalize_plate(plate)
+                conf_pct = round(conf * 100, 1)
+                attempts.append(
+                    {"source": label, "raw": raw, "normalized": plate, "confidence": f"{conf_pct:.1f}%"})
                 if ITALIAN_PLATE_REGEX.match(plate):
-                    candidates.append((plate, conf * 100))
+                    candidates.append((plate, conf_pct))
         except Exception as e:
             logger.error("[ocr] errore OCR: %s", e)
 
     if not candidates:
-        return None, 0.0
+        return None, 0.0, attempts
 
     plate, conf = max(candidates, key=lambda x: x[1])
-    return (plate, conf) if conf >= MIN_CONFIDENCE else (None, conf)
+    return (plate, conf, attempts) if conf >= MIN_CONFIDENCE else (None, conf, attempts)
 
 
 @app.get("/", tags=["Health"])
@@ -173,25 +180,23 @@ async def recognize_plate(file: UploadFile = File(..., description="JPEG/PNG ima
 
     vis, gray = preprocess_gray(img)
 
-    # Prima: OCR diretto su immagine intera
-    full_plate, full_conf = ocr_plate(vis)
+    full_plate, full_conf, full_attempts = ocr_plate(vis)
     if full_plate:
         logger.info(
             f"[recognize] (full) plate={full_plate} conf={full_conf:.1f}%")
-        return {"plate": full_plate, "confidence": round(full_conf, 1), "box": None}
+        return {"plate": full_plate, "confidence": round(full_conf, 1), "box": None, "attempts": full_attempts}
 
-    # Poi: OCR su eventuale bounding box
     rect = find_plate_region(gray)
     if rect:
         x, y, w, h = rect
         crop = four_point_transform(vis, rect)
-        plate, conf = ocr_plate(crop)
+        plate, conf, crop_attempts = ocr_plate(crop)
         logger.info(
             f"[recognize] (crop) plate={plate} conf={conf:.1f}% box={rect}")
-        return {"plate": plate, "confidence": round(conf, 1), "box": [x, y, w, h]}
+        return {"plate": plate, "confidence": round(conf, 1), "box": [x, y, w, h], "attempts": crop_attempts}
 
     logger.info("[recognize] Nessuna targa trovata")
-    return {"plate": None, "confidence": 0.0, "box": None}
+    return {"plate": None, "confidence": 0.0, "box": None, "attempts": []}
 
 if __name__ == "__main__":
     import uvicorn
