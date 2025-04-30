@@ -22,20 +22,16 @@ import cv2
 import numpy as np
 import easyocr
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from pydantic import BaseModel
-from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
+from pydantic import BaseModel
 
 # ─── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
-
-# ─── EasyOCR reader (solo CPU) ─────────────────────────────────────────────
-reader = easyocr.Reader(["en"], gpu=False)
+logger = logging.getLogger("anpr_server")
 
 # ─── Regex per targhe italiane (AA123BB) ───────────────────────────────────
 ITALIAN_PLATE_REGEX = re.compile(r"^[A-Z]{2}[0-9]{3}[A-Z]{2}$")
@@ -49,21 +45,42 @@ class PlateResponse(BaseModel):
     box: Optional[List[int]]  # [x, y, w, h]
 
 
-# ─── App FastAPI ───────────────────────────────────────────────────────────
+# ─── FastAPI app ──────────────────────────────────────────────────────────
 app = FastAPI(
     title="ANPR Server Italiano",
     description="Riconoscimento targhe italiane in locale",
     version="1.0"
 )
 
-# ─── Helper: preprocessing ─────────────────────────────────────────────────
+# ─── CORS ──────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # meglio limitare in produzione
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─── EasyOCR reader placeholder ────────────────────────────────────────────
+reader: easyocr.Reader = None  # verrà inizializzato in startup
+
+
+@app.on_event("startup")
+async def load_easyocr_model():
+    """
+    Evento di avvio: carica il modello EasyOCR per ridurre il picco di memoria
+    e assicurare che Uvicorn sia già in ascolto.
+    """
+    global reader
+    logger.info("[startup] Inizio caricamento modello EasyOCR...")
+    t0 = time.perf_counter()
+    # Carica solo il modello 'en'
+    reader = easyocr.Reader(["en"], gpu=False)
+    elapsed = time.perf_counter() - t0
+    logger.info(
+        f"[startup] Modello EasyOCR caricato in {elapsed:.1f} secondi.")
+
+# ─── Helper: preprocessing ─────────────────────────────────────────────────
 
 
 def preprocess_gray(
@@ -71,8 +88,7 @@ def preprocess_gray(
     width: int = 640
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Ridimensiona l’immagine a `width` px (mantiene proporzioni),
-    converte in scala di grigi ed applica CLAHE.
+    Ridimensiona l’immagine a `width` px, converte in scala di grigi ed applica CLAHE.
     """
     h, w = frame.shape[:2]
     scale = width / float(w)
@@ -90,41 +106,31 @@ def find_plate_region(
     min_area: int = 4500
 ) -> Optional[Tuple[int, int, int, int]]:
     """
-    Rileva contorni tramite Sobel+Otsu+morfologia,
-    ritorna il bounding box (x,y,w,h) del contorno più grande
-    compatibile con aspect-ratio targhe italiane.
+    Rileva contorni con Sobel+Otsu+morfologia,
+    restituisce bounding box più probabile.
     """
-    # 1) Sobel orizzontale
     grad = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     grad = cv2.convertScaleAbs(grad)
-    # 2) Otsu threshold
-    _, bw = cv2.threshold(
-        grad, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-    # 3) Morfologia per unire i caratteri
+    _, bw = cv2.threshold(grad, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     kern = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 5))
     closed = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kern)
     closed = cv2.morphologyEx(closed, cv2.MORPH_OPEN,
                               np.ones((3, 3), np.uint8))
-    # 4) Contorni
+
     cnts, _ = cv2.findContours(
-        closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    best_box = None
-    best_area = 0
+        closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_box, best_area = None, 0
     for cnt in cnts:
         area = cv2.contourArea(cnt)
         if area < min_area:
             continue
         x, y, w, h = cv2.boundingRect(cnt)
         ar = w / float(h) if h > 0 else 0
-        # solo proporzioni in [3.5, 6.0]
         if 3.5 <= ar <= 6.0 and area > best_area:
-            best_area = area
-            best_box = (x, y, w, h)
+            best_area, best_box = area, (x, y, w, h)
     return best_box
 
-# ─── Helper: prospettica + ritaglio ────────────────────────────────────────
+# ─── Helper: prospettiva + ritaglio ────────────────────────────────────────
 
 
 def four_point_transform(
@@ -132,7 +138,7 @@ def four_point_transform(
     rect: Tuple[int, int, int, int]
 ) -> np.ndarray:
     """
-    Applica transform prospettica su rect=(x,y,w,h) e restituisce il crop.
+    Applica trasformazione prospettica a rect e restituisce crop.
     """
     x, y, w, h = rect
     src = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype="float32")
@@ -145,25 +151,25 @@ def four_point_transform(
 
 def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float]:
     """
-    Applica EasyOCR sul crop, filtra i risultati con regex targa,
-    ritorna (plate, confidence) del candidato migliore.
+    Esegue EasyOCR sul crop, filtra con regex, restituisce plate e conf.
     """
     raw = reader.readtext(crop, detail=1)
-    cands: List[Tuple[str, float]] = []
+    candidates: List[Tuple[str, float]] = []
     for _, text, conf in raw:
         plate = re.sub(r'[^A-Za-z0-9]', '', text).upper()
         if ITALIAN_PLATE_REGEX.match(plate):
-            cands.append((plate, conf * 100))
-    if not cands:
+            candidates.append((plate, conf * 100))
+    if not candidates:
         return None, 0.0
-    # prendi quello a conf più alta
-    return max(cands, key=lambda x: x[1])
+    best = max(candidates, key=lambda x: x[1])
+    return best
 
 # ─── Endpoint: health check ───────────────────────────────────────────────
 
 
 @app.get("/", tags=["Health"])
 async def health_check():
+    logger.info("[health] OK")
     return {"status": "ok", "message": "ANPR Server in esecuzione"}
 
 # ─── Endpoint: riconoscimento ─────────────────────────────────────────────
@@ -178,14 +184,17 @@ async def health_check():
 async def recognize_plate(
     file: UploadFile = File(..., description="Immagine JPEG o PNG")
 ):
-    # validation content-type
+    logger.info(f"[recognize] Ricevuto file, content_type={file.content_type}")
     if file.content_type not in ("image/jpeg", "image/png"):
+        logger.warning(
+            "[recognize] Formato non supportato: %s", file.content_type)
         raise HTTPException(status_code=415, detail="Formato non supportato")
 
     data = await file.read()
     arr = np.frombuffer(data, np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if frame is None:
+        logger.error("[recognize] Impossibile decodificare l'immagine")
         raise HTTPException(
             status_code=400, detail="Impossibile decodificare l’immagine")
 
@@ -202,14 +211,10 @@ async def recognize_plate(
         plate, conf, box = None, 0.0, None
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    logging.info(
-        f"Processed in {elapsed_ms:.1f} ms – Plate={plate} ({conf:.1f}%) Box={box}")
-
-    return {
-        "plate": plate,
-        "confidence": round(conf, 1),
-        "box": box
-    }
+    logger.info(
+        f"[recognize] Elaborazione in {elapsed_ms:.1f}ms – Plate={plate} Conf={conf:.1f}% Box={box}"
+    )
+    return {"plate": plate, "confidence": round(conf, 1), "box": box}
 
 # ─── Avvio standalone ─────────────────────────────────────────────────────
 if __name__ == "__main__":
