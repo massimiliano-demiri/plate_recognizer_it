@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ANPR Server per targhe italiane (versione smart con correzione luce e OCR avanzato)
---------------------------------------------------------------------------
+ANPR Server per targhe italiane (versione avanzata con debug)
+-------------------------------------------------------------
 
 Espone un’API REST che riceve immagini via POST e risponde
 con la targa riconosciuta, la confidenza, la bounding box e i tentativi OCR.
@@ -9,7 +9,7 @@ con la targa riconosciuta, la confidenza, la bounding box e i tentativi OCR.
 Dipendenze:
     pip install fastapi uvicorn easyocr opencv-python-headless numpy pydantic python-multipart
 
-Esecuzione:
+Esempio di utilizzo:
     uvicorn server:app --host 0.0.0.0 --port 8000
 """
 
@@ -26,14 +26,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # Logging setup
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("smart_anpr")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("anpr_server")
 
-ITALIAN_PLATE_REGEX = re.compile(r"^[A-Z]{2}[0-9]{2,4}[A-Z]{1,3}$")
+# Regex per targhe italiane (AA123BB)
+ITALIAN_PLATE_REGEX = re.compile(
+    r"^[A-Z]{2}[0-9]{2,4}[A-Z]{1,3}$")  # estesa per tolleranza
 
-MIN_CONFIDENCE = 30.0
+# Configurazione OCR
 UPSCALE_FACTOR = 2
+MIN_CONFIDENCE = 25.0  # abbassata per maggiore tolleranza
+
+# Response model
 
 
 class PlateResponse(BaseModel):
@@ -43,8 +51,14 @@ class PlateResponse(BaseModel):
     attempts: List[Dict[str, str]]
 
 
-app = FastAPI(title="Smart ANPR Server", version="2.0")
+# FastAPI app
+app = FastAPI(
+    title="ANPR Server Italiano",
+    description="Riconoscimento targhe italiane avanzato in locale",
+    version="1.5"
+)
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,132 +67,136 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# EasyOCR reader placeholder
 reader: easyocr.Reader = None
 
 
 @app.on_event("startup")
-async def load_ocr():
+async def load_easyocr_model():
     global reader
-    logger.info("Caricamento modello OCR...")
+    logger.info("[startup] Caricamento modello EasyOCR...")
     t0 = time.perf_counter()
     reader = easyocr.Reader(["en", "it"], gpu=False)
-    logger.info(f"Modello OCR caricato in {time.perf_counter() - t0:.2f}s")
+    logger.info(
+        f"[startup] EasyOCR caricato in {time.perf_counter() - t0:.1f}s")
 
 
-def adjust_gamma(image: np.ndarray, gamma: float = 1.5) -> np.ndarray:
-    invGamma = 1.0 / gamma
-    table = np.array([(i / 255.0) ** invGamma *
-                     255 for i in np.arange(256)]).astype("uint8")
-    return cv2.LUT(image, table)
-
-
-def auto_white_balance(img: np.ndarray) -> np.ndarray:
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    avg_a = np.average(lab[:, :, 1])
-    avg_b = np.average(lab[:, :, 2])
-    lab[:, :, 1] -= ((avg_a - 128) * (lab[:, :, 0] / 255.0) * 1.1)
-    lab[:, :, 2] -= ((avg_b - 128) * (lab[:, :, 0] / 255.0) * 1.1)
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-
-def preprocess_variants(img: np.ndarray) -> Dict[str, np.ndarray]:
-    variants = {}
+def preprocess_gray(frame: np.ndarray, width: int = 640) -> Tuple[np.ndarray, np.ndarray]:
+    h, w = frame.shape[:2]
+    scale = width / float(w)
+    resized = cv2.resize(frame, (width, int(h * scale)))
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    variants["gray"] = gray
-    variants["clahe"] = clahe.apply(gray)
-    variants["gamma"] = adjust_gamma(gray, 1.5)
-    variants["inverted"] = cv2.bitwise_not(gray)
-    variants["binarized"] = cv2.threshold(
-        gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    return variants
+    return resized, clahe.apply(gray)
+
+
+def find_plate_region(gray: np.ndarray, min_area: int = 1000, ar_range: Tuple[float, float] = (2.0, 8.0)) -> Optional[Tuple[int, int, int, int]]:
+    sob = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sob = cv2.convertScaleAbs(sob)
+    _, bw = cv2.threshold(sob, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 5))
+    closed = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kern)
+    if cv2.countNonZero(closed) < min_area:
+        closed = cv2.Canny(gray, 50, 150)
+    cnts, _ = cv2.findContours(
+        closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for cnt in cnts:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        ar = w / float(h) if h > 0 else 0
+        if ar_range[0] <= ar <= ar_range[1]:
+            boxes.append((x, y, w, h))
+    return max(boxes, key=lambda b: b[2]*b[3]) if boxes else None
+
+
+def four_point_transform(img: np.ndarray, rect: Tuple[int, int, int, int]) -> np.ndarray:
+    x, y, w, h = rect
+    src = np.array([[x, y], [x + w, y], [x + w, y + h],
+                   [x, y + h]], dtype="float32")
+    dst = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype="float32")
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(img, M, (w, h))
 
 
 def normalize_plate(plate: str) -> str:
     return plate.replace("0", "O").replace("1", "I")
 
 
-def extract_candidates(img_variants: Dict[str, np.ndarray]) -> Tuple[Optional[str], float, List[Dict[str, str]]]:
-    attempts = []
-    candidates = []
-    for label, img in img_variants.items():
+def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float, List[Dict[str, str]]]:
+    h, w = crop.shape[:2]
+    scaled = cv2.resize(crop, (w * UPSCALE_FACTOR, h *
+                        UPSCALE_FACTOR), interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+    _, binarized = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    inverted = cv2.bitwise_not(binarized)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    inputs = [("binarized", binarized),
+              ("inverted", inverted), ("enhanced", enhanced)]
+    candidates: List[Tuple[str, float]] = []
+    attempts: List[Dict[str, str]] = []
+
+    for label, img in inputs:
         try:
             results = reader.readtext(img, detail=1)
             for _, text, conf in results:
                 raw = text
-                plate = re.sub(r'[^A-Za-z0-9]', '', raw).upper()
+                plate = re.sub(r'[^A-Za-z0-9]', '', text).upper()
                 plate = normalize_plate(plate)
                 conf_pct = round(conf * 100, 1)
-                is_valid = bool(ITALIAN_PLATE_REGEX.match(plate))
                 attempts.append({"source": label, "raw": raw, "normalized": plate,
-                                "confidence": f"{conf_pct:.1f}%", "valid": str(is_valid)})
-                if is_valid:
+                                "confidence": f"{conf_pct:.1f}%", "valid": str(bool(ITALIAN_PLATE_REGEX.match(plate)))})
+                if ITALIAN_PLATE_REGEX.match(plate):
                     candidates.append((plate, conf_pct))
         except Exception as e:
-            logger.warning(f"[OCR:{label}] Errore: {e}")
+            logger.error("[ocr] errore OCR: %s", e)
+
     if not candidates:
         return None, 0.0, attempts
-    best_plate, best_conf = max(candidates, key=lambda x: x[1])
-    return (best_plate, best_conf, attempts) if best_conf >= MIN_CONFIDENCE else (None, best_conf, attempts)
+
+    plate, conf = max(candidates, key=lambda x: x[1])
+    return (plate, conf, attempts) if conf >= MIN_CONFIDENCE else (None, conf, attempts)
 
 
-def detect_plate_regions(img: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    sobel = cv2.Sobel(gray, cv2.CV_8U, 1, 0, ksize=3)
-    _, thresh = cv2.threshold(
-        sobel, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 5))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kern)
-    contours, _ = cv2.findContours(
-        closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        area = w * h
-        ar = w / h if h > 0 else 0
-        if area > 1500 and 2 < ar < 8:
-            boxes.append((x, y, w, h))
-    return boxes
-
-
-def extract_region(img: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
-    x, y, w, h = box
-    return img[y:y+h, x:x+w]
-
-
-@app.get("/")
-async def health():
+@app.get("/", tags=["Health"])
+async def health_check():
     return {"status": "ok"}
 
 
-@app.post("/recognize", response_model=PlateResponse)
-async def recognize(file: UploadFile = File(...)):
-    logger.info(f"[recognize] Ricevuto: {file.filename}")
+@app.post("/recognize", response_model=PlateResponse, tags=["ANPR"])
+async def recognize_plate(file: UploadFile = File(..., description="JPEG/PNG image")):
+    logger.info("[recognize] ricezione file %s", file.filename)
     if file.content_type not in ("image/jpeg", "image/png"):
         raise HTTPException(status_code=415, detail="Formato non supportato")
-
-    img = cv2.imdecode(np.frombuffer(await file.read(), np.uint8), cv2.IMREAD_COLOR)
+    data = await file.read()
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
-        raise HTTPException(status_code=400, detail="Immagine non valida")
+        raise HTTPException(
+            status_code=400, detail="Impossibile decodificare immagine")
 
-    img = auto_white_balance(img)
-    full_attempts_img = preprocess_variants(img)
-    full_plate, full_conf, full_attempts = extract_candidates(
-        full_attempts_img)
+    vis, gray = preprocess_gray(img)
+
+    full_plate, full_conf, full_attempts = ocr_plate(vis)
     if full_plate:
-        logger.info(f"[full image] plate={full_plate} conf={full_conf:.1f}%")
+        logger.info(
+            f"[recognize] (full) plate={full_plate} conf={full_conf:.1f}%")
         return {"plate": full_plate, "confidence": round(full_conf, 1), "box": None, "attempts": full_attempts}
 
-    regions = detect_plate_regions(img)
-    for rect in regions:
-        region = extract_region(img, rect)
-        region_attempts = preprocess_variants(region)
-        plate, conf, crop_attempts = extract_candidates(region_attempts)
-        if plate:
-            logger.info(f"[region] plate={plate} conf={conf:.1f}% box={rect}")
-            return {"plate": plate, "confidence": round(conf, 1), "box": list(rect), "attempts": crop_attempts}
+    rect = find_plate_region(gray)
+    if rect:
+        x, y, w, h = rect
+        crop = four_point_transform(vis, rect)
+        plate, conf, crop_attempts = ocr_plate(crop)
+        logger.info(
+            f"[recognize] (crop) plate={plate} conf={conf:.1f}% box={rect}")
+        return {"plate": plate, "confidence": round(conf, 1), "box": [x, y, w, h], "attempts": crop_attempts}
 
-    logger.info("[recognize] Nessuna targa rilevata")
+    logger.info("[recognize] Nessuna targa trovata")
     return {"plate": None, "confidence": 0.0, "box": None, "attempts": []}
 
 if __name__ == "__main__":
