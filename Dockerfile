@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ─── PRE-DOWNLOAD DEL MODELLO EasyOCR ───────────────────────────────────────
 RUN python3 - << 'EOF'
 import easyocr
-# questo scarica e serializza il modello 'en' nella cache di EasyOCR
+# Scarica e serializza il modello 'en' nella cache di EasyOCR
 easyocr.Reader(['en'], gpu=False)
 EOF
 
@@ -26,5 +26,5 @@ COPY . .
 
 EXPOSE 8000
 
-# Avvia uvicorn sul modulo server.py (app = FastAPI())
+# Avvia uvicorn
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
