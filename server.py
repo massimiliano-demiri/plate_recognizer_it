@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ANPR Server per targhe italiane (versione migliorata)
-----------------------------------------------------
+ANPR Server per targhe italiane (versione intelligente)
+--------------------------------------------------------
 
 Espone un’API REST che riceve immagini via POST e risponde
 con la targa riconosciuta, la confidenza e la bounding box.
@@ -52,8 +52,8 @@ class PlateResponse(BaseModel):
 # FastAPI app
 app = FastAPI(
     title="ANPR Server Italiano",
-    description="Riconoscimento targhe italiane in locale",
-    version="1.3"
+    description="Riconoscimento targhe italiane intelligente in locale",
+    version="1.4"
 )
 
 # CORS
@@ -88,7 +88,7 @@ def preprocess_gray(frame: np.ndarray, width: int = 640) -> Tuple[np.ndarray, np
     return resized, clahe.apply(gray)
 
 
-def find_plate_region(gray: np.ndarray, min_area: int = 1500, ar_range: Tuple[float, float] = (2.0, 8.0)) -> Optional[Tuple[int, int, int, int]]:
+def find_plate_region(gray: np.ndarray, min_area: int = 1000, ar_range: Tuple[float, float] = (2.0, 8.0)) -> Optional[Tuple[int, int, int, int]]:
     sob = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     sob = cv2.convertScaleAbs(sob)
     _, bw = cv2.threshold(sob, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -98,16 +98,16 @@ def find_plate_region(gray: np.ndarray, min_area: int = 1500, ar_range: Tuple[fl
         closed = cv2.Canny(gray, 50, 150)
     cnts, _ = cv2.findContours(
         closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best_box, best_area = None, 0
+    boxes = []
     for cnt in cnts:
         area = cv2.contourArea(cnt)
         if area < min_area:
             continue
         x, y, w, h = cv2.boundingRect(cnt)
         ar = w / float(h) if h > 0 else 0
-        if ar_range[0] <= ar <= ar_range[1] and area > best_area:
-            best_area, best_box = area, (x, y, w, h)
-    return best_box
+        if ar_range[0] <= ar <= ar_range[1]:
+            boxes.append((x, y, w, h))
+    return max(boxes, key=lambda b: b[2]*b[3]) if boxes else None
 
 
 def four_point_transform(img: np.ndarray, rect: Tuple[int, int, int, int]) -> np.ndarray:
@@ -117,6 +117,10 @@ def four_point_transform(img: np.ndarray, rect: Tuple[int, int, int, int]) -> np
     dst = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype="float32")
     M = cv2.getPerspectiveTransform(src, dst)
     return cv2.warpPerspective(img, M, (w, h))
+
+
+def normalize_plate(plate: str) -> str:
+    return plate.replace("0", "O").replace("1", "I")
 
 
 def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float]:
@@ -138,6 +142,7 @@ def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float]:
             results = reader.readtext(img, detail=1)
             for _, text, conf in results:
                 plate = re.sub(r'[^A-Za-z0-9]', '', text).upper()
+                plate = normalize_plate(plate)
                 if ITALIAN_PLATE_REGEX.match(plate):
                     candidates.append((plate, conf * 100))
         except Exception as e:
@@ -167,19 +172,26 @@ async def recognize_plate(file: UploadFile = File(..., description="JPEG/PNG ima
             status_code=400, detail="Impossibile decodificare immagine")
 
     vis, gray = preprocess_gray(img)
-    rect = find_plate_region(gray)
 
+    # Prima: OCR diretto su immagine intera
+    full_plate, full_conf = ocr_plate(vis)
+    if full_plate:
+        logger.info(
+            f"[recognize] (full) plate={full_plate} conf={full_conf:.1f}%")
+        return {"plate": full_plate, "confidence": round(full_conf, 1), "box": None}
+
+    # Poi: OCR su eventuale bounding box
+    rect = find_plate_region(gray)
     if rect:
         x, y, w, h = rect
         crop = four_point_transform(vis, rect)
         plate, conf = ocr_plate(crop)
-        logger.info(f"[recognize] plate={plate} conf={conf:.1f}% box={rect}")
-        return {"plate": plate, "confidence": round(conf, 1), "box": [x, y, w, h]}
-    else:
         logger.info(
-            "[recognize] bounding box fallita, provo OCR su intera immagine")
-        plate, conf = ocr_plate(vis)
-        return {"plate": plate, "confidence": round(conf, 1), "box": None}
+            f"[recognize] (crop) plate={plate} conf={conf:.1f}% box={rect}")
+        return {"plate": plate, "confidence": round(conf, 1), "box": [x, y, w, h]}
+
+    logger.info("[recognize] Nessuna targa trovata")
+    return {"plate": None, "confidence": 0.0, "box": None}
 
 if __name__ == "__main__":
     import uvicorn
