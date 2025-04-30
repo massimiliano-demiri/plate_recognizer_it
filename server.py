@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
 """
-ANPR Server per targhe italiane - Versione Migliorata
---------------------------------------------------
+ANPR Server per targhe italiane
+-------------------------------
 
 Espone un’API REST che riceve immagini via POST e risponde
 con la targa riconosciuta, la confidenza e la bounding box.
 
-Migliorie implementate:
-- Rilevamento regione 2-stage con EAST text detector e Sobel+MSER fallback
-- Preprocessing multi-variant (CLAHE, AdaptiveThreshold, Bilateral Filter)
-- Super-resolution upscaling opzionale via OpenCV DNN SuperRes
-- Ensemble OCR: EasyOCR (GPU se disponibile) + Tesseract fallback
-- Filtraggio avanzato candidate con punteggi ponderati
-- Caching del modello OCR & detector
-- Logging dettagliato e metriche di performance
-
 Dipendenze:
-    pip install fastapi uvicorn easyocr pytesseract opencv-python-headless opencv-contrib-python numpy pydantic python-multipart
-    apt-get install tesseract-ocr
+    pip install fastapi uvicorn easyocr opencv-python-headless numpy pydantic python-multipart
 
 Esempio di utilizzo:
-    uvicorn anpr_server_improved:app --host 0.0.0.0 --port 8000
+    uvicorn server:app --host 0.0.0.0 --port 8000
 """
 
 import logging
@@ -31,7 +21,6 @@ from typing import Optional, Tuple, List
 import cv2
 import numpy as np
 import easyocr
-import pytesseract
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -42,15 +31,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-logger = logging.getLogger("anpr_server_improved")
+logger = logging.getLogger("anpr_server")
 
 # ─── Regex per targhe italiane (AA123BB) ───────────────────────────────────
 ITALIAN_PLATE_REGEX = re.compile(r"^[A-Z]{2}[0-9]{3}[A-Z]{2}$")
 
 # ─── Configurazione OCR ─────────────────────────────────────────────────────
-UPSCALE_FACTOR = 2  # fattore di ingrandimento dinamico
+UPSCALE_FACTOR = 2  # Moltiplicatore per ingrandire il crop prima di OCR
 MIN_CONFIDENCE = 40.0  # soglia minima accettabile
-USE_GPU_OCR = True  # EasyOCR su GPU se disponibile
 
 # ─── Response model ────────────────────────────────────────────────────────
 
@@ -63,161 +51,153 @@ class PlateResponse(BaseModel):
 
 # ─── FastAPI app ──────────────────────────────────────────────────────────
 app = FastAPI(
-    title="ANPR Server Italiano Migliorato",
-    description="Riconoscimento targhe italiane con metodi avanzati",
-    version="2.0"
+    title="ANPR Server Italiano",
+    description="Riconoscimento targhe italiane in locale",
+    version="1.2"
 )
 
+# ─── CORS ──────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # in produzione limitare ai domini noti
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─── Modelli caricati in startup ──────────────────────────────────────────
+# ─── EasyOCR reader placeholder ────────────────────────────────────────────
 reader: easyocr.Reader = None
-east_net: cv2.dnn_Net = None
 
 
 @app.on_event("startup")
-async def load_models():
-    global reader, east_net
-    logger.info("[startup] Caricamento modelli in corso...")
+async def load_easyocr_model():
+    """
+    Carica il modello EasyOCR in startup per ridurre il picco di memoria.
+    """
+    global reader
+    logger.info("[startup] Caricamento modello EasyOCR...")
     t0 = time.perf_counter()
-
-    # EasyOCR reader
-    reader = easyocr.Reader(['en'], gpu=USE_GPU_OCR)
-
-    # EAST text detector
-    east_model_path = 'frozen_east_text_detection.pb'
-    east_net = cv2.dnn.readNet(east_model_path)
-
+    reader = easyocr.Reader(["en"], gpu=False)
     logger.info(
-        f"[startup] Modelli caricati in {time.perf_counter() - t0:.1f}s")
+        f"[startup] EasyOCR caricato in {time.perf_counter() - t0:.1f}s")
+
+# ─── Preprocess grayscale con CLAHE ────────────────────────────────────────
+
+
+def preprocess_gray(frame: np.ndarray, width: int = 640) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Ridimensiona, converte in scala di grigi ed applica CLAHE.
+    """
+    h, w = frame.shape[:2]
+    scale = width / float(w)
+    resized = cv2.resize(frame, (width, int(h * scale)))
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return resized, clahe.apply(gray)
+
+# ─── Rilevamento regione targa (Sobel + fallback Canny) ──────────────────
+
+
+def find_plate_region(
+    gray: np.ndarray,
+    min_area: int = 1500,
+    ar_range: Tuple[float, float] = (2.0, 8.0)
+) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Individua il bounding box della targa nella scala di grigi.
+    Usa Sobel e morfologia; se scarsi contorni usa Canny.
+    """
+    # 1) rileva bordi via Sobel + Otsu
+    sob = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sob = cv2.convertScaleAbs(sob)
+    _, bw = cv2.threshold(sob, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # 2) morfologia per unire i caratteri
+    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 5))
+    closed = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kern)
+    if cv2.countNonZero(closed) < min_area:
+        # fallback: Canny
+        closed = cv2.Canny(gray, 50, 150)
+
+    # 3) contorni
+    cnts, _ = cv2.findContours(
+        closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_box, best_area = None, 0
+    for cnt in cnts:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        ar = w / float(h) if h > 0 else 0
+        if ar_range[0] <= ar <= ar_range[1] and area > best_area:
+            best_area, best_box = area, (x, y, w, h)
+    return best_box
+
+# ─── Crop prospettico ─────────────────────────────────────────────────────
+
+
+def four_point_transform(img: np.ndarray, rect: Tuple[int, int, int, int]) -> np.ndarray:
+    """
+    Applica transform prospettica per rettangolo e ritorna crop.
+    """
+    x, y, w, h = rect
+    src = np.array([[x, y], [x + w, y], [x + w, y + h],
+                   [x, y + h]], dtype="float32")
+    dst = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype="float32")
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(img, M, (w, h))
+
+# ─── OCR multipasso e upscaling ───────────────────────────────────────────
+
+
+def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float]:
+    """
+    Esegue OCR su crop, con upscaling e filtri.
+    Ritorna la miglior candidate e conf media.
+    """
+    # 1) upscaling
+    h, w = crop.shape[:2]
+    scaled = cv2.resize(crop, (w * UPSCALE_FACTOR, h *
+                        UPSCALE_FACTOR), interpolation=cv2.INTER_CUBIC)
+    gray_crop = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+    # 2) leggera sogliatura
+    _, thr = cv2.threshold(
+        gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 3) OCR
+    try:
+        raw = reader.readtext(thr, detail=1)
+    except Exception as e:
+        logger.error("[ocr] errore OCR: %s", e)
+        return None, 0.0
+    logger.debug(f"[ocr] raw results: {raw}")
+    candidates: List[Tuple[str, float]] = []
+    for _, text, conf in raw:
+        plate = re.sub(r'[^A-Za-z0-9]', '', text).upper()
+        if ITALIAN_PLATE_REGEX.match(plate):
+            candidates.append((plate, conf * 100))
+    if not candidates:
+        return None, 0.0
+    # 4) aggrega per stringa (se doppioni)
+    # prendi max conf
+    plate, conf = max(candidates, key=lambda x: x[1])
+    # se sotto soglia, considera None
+    if conf < MIN_CONFIDENCE:
+        return None, conf
+    return plate, conf
 
 # ─── Health-check ─────────────────────────────────────────────────────────
 
 
 @app.get("/", tags=["Health"])
 async def health_check():
-    return {"status": "ok", "version": app.version}
-
-# ─── Utility: Super-Resolution (opzionale) ─────────────────────────────────
-try:
-    from cv2 import dnn_superres
-    sr = dnn_superres.DnnSuperResImpl_create()
-    sr.readModel('ESPCN_x2.pb')
-    sr.setModel('espcn', 2)
-
-    def upscale(img: np.ndarray) -> np.ndarray:
-        return sr.upsample(img)
-    logger.info("[startup] SuperRes modello caricato")
-except Exception:
-    def upscale(img: np.ndarray) -> np.ndarray:
-        return cv2.resize(img, (img.shape[1]*UPSCALE_FACTOR, img.shape[0]*UPSCALE_FACTOR), interpolation=cv2.INTER_CUBIC)
-    logger.warning("[startup] SuperRes non disponibile, uso resize standard")
-
-# ─── Rilevamento regione targa con EAST detector ─────────────────────────
-
-
-def detect_text_regions_east(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    """Ritorna bounding box candidate rilevate da EAST text detector."""
-    H, W = image.shape[:2]
-    newW, newH = (320, 320)
-    rW, rH = W/float(newW), H/float(newH)
-    blob = cv2.dnn.blobFromImage(
-        image, 1.0, (newW, newH), (123.68, 116.78, 103.94), True, False)
-    east_net.setInput(blob)
-    (scores, geometry) = east_net.forward(
-        ['feature_fusion/Conv_7/Sigmoid', 'feature_fusion/concat_3'])
-
-    rects = []
-    confidences = []
-    for y in range(scores.shape[2]):
-        for x in range(scores.shape[3]):
-            score = scores[0, 0, y, x]
-            if score < 0.5:
-                continue
-            offsetX, offsetY = x*4.0, y*4.0
-            angle = geometry[0, 4, y, x]
-            cos = np.cos(angle)
-            sin = np.sin(angle)
-            h = geometry[0, 0, y, x] + geometry[0, 2, y, x]
-            w = geometry[0, 1, y, x] + geometry[0, 3, y, x]
-            endX = int(offsetX + cos *
-                       geometry[0, 1, y, x] + sin * geometry[0, 2, y, x])
-            endY = int(offsetY - sin *
-                       geometry[0, 1, y, x] + cos * geometry[0, 2, y, x])
-            startX = int(endX - w)
-            startY = int(endY - h)
-            rects.append(
-                (int(startX*rW), int(startY*rH), int(w*rW), int(h*rH)))
-            confidences.append(float(score))
-    picks = cv2.dnn.NMSBoxes(rects, confidences, 0.5, 0.4)
-    boxes = [rects[i[0]] for i in picks]
-    return boxes
-
-# ─── OCR multipasso e ensemble ──────────────────────────────────────────────
-
-
-def ocr_ensemble(crop: np.ndarray) -> Tuple[Optional[str], float]:
-    """Applica diversi preprocess e OCR engines, aggrega i risultati."""
-    variants = []
-    # Original upscaled
-    img_up = upscale(crop)
-    variants.append(img_up)
-    # CLAHE
-    lab = cv2.cvtColor(img_up, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
-    variants.append(cv2.cvtColor(cv2.merge((clahe, a, b)), cv2.COLOR_LAB2BGR))
-    # Adaptive Thresh
-    gray = cv2.cvtColor(img_up, cv2.COLOR_BGR2GRAY)
-    variants.append(cv2.cvtColor(cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 5), cv2.COLOR_GRAY2BGR))
-    # Bilateral filter
-    variants.append(cv2.bilateralFilter(img_up, 9, 75, 75))
-
-    candidates = {}
-    for var in variants:
-        # EasyOCR
-        try:
-            results = reader.readtext(var, detail=1)
-            for _, text, conf in results:
-                plate = re.sub(r'[^A-Za-z0-9]', '', text).upper()
-                if ITALIAN_PLATE_REGEX.match(plate):
-                    score = conf*100 * 0.7
-                    candidates[plate] = max(candidates.get(plate, 0), score)
-        except Exception as e:
-            logger.debug(f"[ocr_ez] errore OCR EasyOCR: {e}")
-        # Tesseract
-        try:
-            cfg = '--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-            txt = pytesseract.image_to_string(var, config=cfg)
-            plate = re.sub(r'[^A-Za-z0-9]', '', txt).upper()
-            if ITALIAN_PLATE_REGEX.match(plate):
-                conf_t = np.mean(pytesseract.image_to_data(
-                    var, config=cfg, output_type=pytesseract.Output.DICT)['conf'])
-                score = conf_t * 0.3
-                candidates[plate] = max(candidates.get(plate, 0), score)
-        except Exception as e:
-            logger.debug(f"[ocr_tes] errore OCR Tesseract: {e}")
-
-    if not candidates:
-        return None, 0.0
-    best_plate, best_score = max(candidates.items(), key=lambda x: x[1])
-    if best_score < MIN_CONFIDENCE:
-        return None, best_score
-    return best_plate, best_score
+    return {"status": "ok"}
 
 # ─── Endpoint principale ───────────────────────────────────────────────────
 
 
 @app.post("/recognize", response_model=PlateResponse, tags=["ANPR"])
 async def recognize_plate(file: UploadFile = File(..., description="JPEG/PNG image")):
-    logger.info(f"[recognize] Ricevuto file {file.filename}")
+    logger.info("[recognize] ricezione file %s", file.filename)
     if file.content_type not in ("image/jpeg", "image/png"):
         raise HTTPException(status_code=415, detail="Formato non supportato")
     data = await file.read()
@@ -226,32 +206,19 @@ async def recognize_plate(file: UploadFile = File(..., description="JPEG/PNG ima
         raise HTTPException(
             status_code=400, detail="Impossibile decodificare immagine")
 
-    t_start = time.perf_counter()
-    # 1) rilevamento testo con EAST
-    boxes = detect_text_regions_east(img)
-    # fallback Sobel+MSER
-    if not boxes:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        mser = cv2.MSER_create(_min_area=500, _max_area=10000)
-        regs, _ = mser.detectRegions(gray)
-        boxes = [cv2.boundingRect(r) for r in regs]
-    best_box, best_plate, best_conf = None, None, 0.0
-    for rect in boxes:
-        x, y, w, h = rect
-        roi = img[y:y+h, x:x+w]
-        plate, conf = ocr_ensemble(roi)
-        if plate and conf > best_conf:
-            best_conf, best_plate, best_box = conf, plate, rect
-
-    duration = time.perf_counter() - t_start
-    logger.info(
-        f"[recognize] plate={best_plate} conf={best_conf:.1f}% box={best_box} time={duration:.2f}s")
-    if not best_box:
+    # preprocessing e ricerca bounding box
+    vis, gray = preprocess_gray(img)
+    rect = find_plate_region(gray)
+    if not rect:
+        logger.info("[recognize] nessuna regione targa trovata")
         return {"plate": None, "confidence": 0.0, "box": None}
-    x, y, w, h = best_box
-    return {"plate": best_plate, "confidence": round(best_conf, 1), "box": [x, y, w, h]}
+
+    x, y, w, h = rect
+    crop = four_point_transform(vis, rect)
+    plate, conf = ocr_plate(crop)
+    logger.info(f"[recognize] plate={plate} conf={conf:.1f}% box={rect}")
+    return {"plate": plate, "confidence": round(conf, 1), "box": [x, y, w, h]}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("anpr_server_improved:app",
-                host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
