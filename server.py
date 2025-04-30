@@ -7,7 +7,7 @@ Espone un’API REST che riceve immagini via POST e risponde
 con la targa riconosciuta, la confidenza e la bounding box.
 
 Dipendenze:
-    pip install fastapi uvicorn easyocr opencv-python-headless numpy pydantic
+    pip install fastapi uvicorn easyocr opencv-python-headless numpy pydantic python-multipart
 
 Esempio di utilizzo:
     uvicorn server:app --host 0.0.0.0 --port 8000
@@ -25,7 +25,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ─── Logging ───────────────────────────────────────────────────────────────
+# ─── Logging setup ─────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -34,6 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger("anpr_server")
 
 # ─── Regex per targhe italiane (AA123BB) ───────────────────────────────────
+# Accetta anche eventuali spazi o trattini, che verranno rimossi in post
 ITALIAN_PLATE_REGEX = re.compile(r"^[A-Z]{2}[0-9]{3}[A-Z]{2}$")
 
 # ─── Response model ────────────────────────────────────────────────────────
@@ -55,30 +56,27 @@ app = FastAPI(
 # ─── CORS ──────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # meglio limitare in produzione
+    allow_origins=["*"],  # in produzione specificare gli origin autorizzati
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ─── EasyOCR reader placeholder ────────────────────────────────────────────
-reader: easyocr.Reader = None  # verrà inizializzato in startup
+reader: easyocr.Reader = None
 
 
 @app.on_event("startup")
 async def load_easyocr_model():
     """
-    Evento di avvio: carica il modello EasyOCR per ridurre il picco di memoria
-    e assicurare che Uvicorn sia già in ascolto.
+    Carica il modello EasyOCR in startup per ridurre picchi di memoria all'avvio.
     """
     global reader
     logger.info("[startup] Inizio caricamento modello EasyOCR...")
     t0 = time.perf_counter()
-    # Carica solo il modello 'en'
     reader = easyocr.Reader(["en"], gpu=False)
     elapsed = time.perf_counter() - t0
-    logger.info(
-        f"[startup] Modello EasyOCR caricato in {elapsed:.1f} secondi.")
+    logger.info(f"[startup] Modello EasyOCR caricato in {elapsed:.1f}s")
 
 # ─── Helper: preprocessing ─────────────────────────────────────────────────
 
@@ -88,7 +86,7 @@ def preprocess_gray(
     width: int = 640
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Ridimensiona l’immagine a `width` px, converte in scala di grigi ed applica CLAHE.
+    Ridimensiona, converte in scala di grigi ed applica CLAHE.
     """
     h, w = frame.shape[:2]
     scale = width / float(w)
@@ -103,11 +101,12 @@ def preprocess_gray(
 
 def find_plate_region(
     gray: np.ndarray,
-    min_area: int = 4500
+    min_area: int = 2000,
+    ar_range: Tuple[float, float] = (2.5, 7.0)
 ) -> Optional[Tuple[int, int, int, int]]:
     """
-    Rileva contorni con Sobel+Otsu+morfologia,
-    restituisce bounding box più probabile.
+    Rileva contorni tramite Sobel+Otsu+morfologia,
+    ritorna bounding box di maggiore area compatibile.
     """
     grad = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     grad = cv2.convertScaleAbs(grad)
@@ -126,7 +125,7 @@ def find_plate_region(
             continue
         x, y, w, h = cv2.boundingRect(cnt)
         ar = w / float(h) if h > 0 else 0
-        if 3.5 <= ar <= 6.0 and area > best_area:
+        if ar_range[0] <= ar <= ar_range[1] and area > best_area:
             best_area, best_box = area, (x, y, w, h)
     return best_box
 
@@ -138,7 +137,7 @@ def four_point_transform(
     rect: Tuple[int, int, int, int]
 ) -> np.ndarray:
     """
-    Applica trasformazione prospettica a rect e restituisce crop.
+    Applica transform prospettica e restituisce il crop rect.
     """
     x, y, w, h = rect
     src = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype="float32")
@@ -151,9 +150,10 @@ def four_point_transform(
 
 def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float]:
     """
-    Esegue EasyOCR sul crop, filtra con regex, restituisce plate e conf.
+    Applica EasyOCR e filtra risultati con regex.
     """
     raw = reader.readtext(crop, detail=1)
+    logger.debug(f"[ocr_plate] raw results: {raw}")
     candidates: List[Tuple[str, float]] = []
     for _, text, conf in raw:
         plate = re.sub(r'[^A-Za-z0-9]', '', text).upper()
@@ -179,7 +179,7 @@ async def health_check():
     "/recognize",
     response_model=PlateResponse,
     tags=["ANPR"],
-    summary="Riconosce la targa da un’immagine",
+    summary="Riconosce la targa da un’immagine"
 )
 async def recognize_plate(
     file: UploadFile = File(..., description="Immagine JPEG o PNG")
@@ -187,33 +187,37 @@ async def recognize_plate(
     logger.info(f"[recognize] Ricevuto file, content_type={file.content_type}")
     if file.content_type not in ("image/jpeg", "image/png"):
         logger.warning(
-            "[recognize] Formato non supportato: %s", file.content_type)
+            f"[recognize] Formato non supportato: {file.content_type}")
         raise HTTPException(status_code=415, detail="Formato non supportato")
 
     data = await file.read()
     arr = np.frombuffer(data, np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    logger.debug(
+        f"[recognize] frame shape: {None if frame is None else frame.shape}")
     if frame is None:
         logger.error("[recognize] Impossibile decodificare l'immagine")
         raise HTTPException(
             status_code=400, detail="Impossibile decodificare l’immagine")
 
-    t0 = time.perf_counter()
     vis, gray = preprocess_gray(frame)
+    logger.debug(f"[recognize] preprocessed gray shape: {gray.shape}")
     rect = find_plate_region(gray)
+    logger.debug(f"[recognize] find_plate_region ➞ {rect}")
 
     if rect:
         x, y, w, h = rect
         crop = four_point_transform(vis, rect)
+        # Salva per debug locale
+        cv2.imwrite("/tmp/last_crop.jpg", crop)
         plate, conf = ocr_plate(crop)
         box = [x, y, w, h]
+        logger.info(
+            f"[recognize] Plate detected: {plate}, Conf={conf:.1f}%, Box={box}")
     else:
         plate, conf, box = None, 0.0, None
+        logger.info("[recognize] Nessuna regione targa trovata")
 
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    logger.info(
-        f"[recognize] Elaborazione in {elapsed_ms:.1f}ms – Plate={plate} Conf={conf:.1f}% Box={box}"
-    )
     return {"plate": plate, "confidence": round(conf, 1), "box": box}
 
 # ─── Avvio standalone ─────────────────────────────────────────────────────
