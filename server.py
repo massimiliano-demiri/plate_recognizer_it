@@ -36,6 +36,10 @@ logger = logging.getLogger("anpr_server")
 # ─── Regex per targhe italiane (AA123BB) ───────────────────────────────────
 ITALIAN_PLATE_REGEX = re.compile(r"^[A-Z]{2}[0-9]{3}[A-Z]{2}$")
 
+# ─── Configurazione OCR ─────────────────────────────────────────────────────
+UPSCALE_FACTOR = 2  # Moltiplicatore per ingrandire il crop prima di OCR
+MIN_CONFIDENCE = 40.0  # soglia minima accettabile
+
 # ─── Response model ────────────────────────────────────────────────────────
 
 
@@ -49,13 +53,13 @@ class PlateResponse(BaseModel):
 app = FastAPI(
     title="ANPR Server Italiano",
     description="Riconoscimento targhe italiane in locale",
-    version="1.1"
+    version="1.2"
 )
 
 # ─── CORS ──────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # in produzione limitare ai domini noti
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,16 +71,23 @@ reader: easyocr.Reader = None
 
 @app.on_event("startup")
 async def load_easyocr_model():
-    logger.info("[startup] Loading EasyOCR model...")
-    t0 = time.perf_counter()
+    """
+    Carica il modello EasyOCR in startup per ridurre il picco di memoria.
+    """
     global reader
+    logger.info("[startup] Caricamento modello EasyOCR...")
+    t0 = time.perf_counter()
     reader = easyocr.Reader(["en"], gpu=False)
-    logger.info(f"[startup] EasyOCR loaded in {time.perf_counter() - t0:.1f}s")
+    logger.info(
+        f"[startup] EasyOCR caricato in {time.perf_counter() - t0:.1f}s")
 
-# ─── Preprocess grayscale with CLAHE ────────────────────────────────────────
+# ─── Preprocess grayscale con CLAHE ────────────────────────────────────────
 
 
 def preprocess_gray(frame: np.ndarray, width: int = 640) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Ridimensiona, converte in scala di grigi ed applica CLAHE.
+    """
     h, w = frame.shape[:2]
     scale = width / float(w)
     resized = cv2.resize(frame, (width, int(h * scale)))
@@ -84,90 +95,128 @@ def preprocess_gray(frame: np.ndarray, width: int = 640) -> Tuple[np.ndarray, np
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return resized, clahe.apply(gray)
 
-# ─── Find plate region via Sobel+morpho + fallback Canny ──────────────────
+# ─── Rilevamento regione targa (Sobel + fallback Canny) ──────────────────
 
 
-def find_plate_region(gray: np.ndarray,
-                      min_area: int = 1500,
-                      ar_range: Tuple[float, float] = (2.0, 8.0)) -> Optional[Tuple[int, int, int, int]]:
-    def detect_edges(img):
-        sob = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
-        sob = cv2.convertScaleAbs(sob)
-        _, thr = cv2.threshold(sob, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        return thr
+def find_plate_region(
+    gray: np.ndarray,
+    min_area: int = 1500,
+    ar_range: Tuple[float, float] = (2.0, 8.0)
+) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Individua il bounding box della targa nella scala di grigi.
+    Usa Sobel e morfologia; se scarsi contorni usa Canny.
+    """
+    # 1) rileva bordi via Sobel + Otsu
+    sob = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sob = cv2.convertScaleAbs(sob)
+    _, bw = cv2.threshold(sob, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    def detect_canny(img):
-        return cv2.Canny(img, 50, 150)
+    # 2) morfologia per unire i caratteri
+    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 5))
+    closed = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kern)
+    if cv2.countNonZero(closed) < min_area:
+        # fallback: Canny
+        closed = cv2.Canny(gray, 50, 150)
 
-    bw = detect_edges(gray)
-    morphed = cv2.morphologyEx(
-        bw, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 5)))
-    cand = morphed
-    if cv2.countNonZero(cand) < 1000:
-        cand = detect_canny(gray)
-
+    # 3) contorni
     cnts, _ = cv2.findContours(
-        cand, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best_box = None
-    best_area = 0
+        closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_box, best_area = None, 0
     for cnt in cnts:
         area = cv2.contourArea(cnt)
         if area < min_area:
             continue
         x, y, w, h = cv2.boundingRect(cnt)
-        ar = w/float(h) if h > 0 else 0
+        ar = w / float(h) if h > 0 else 0
         if ar_range[0] <= ar <= ar_range[1] and area > best_area:
             best_area, best_box = area, (x, y, w, h)
     return best_box
 
-# ─── Perspective crop ─────────────────────────────────────────────────────
+# ─── Crop prospettico ─────────────────────────────────────────────────────
 
 
 def four_point_transform(img: np.ndarray, rect: Tuple[int, int, int, int]) -> np.ndarray:
+    """
+    Applica transform prospettica per rettangolo e ritorna crop.
+    """
     x, y, w, h = rect
-    src = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype="float32")
+    src = np.array([[x, y], [x + w, y], [x + w, y + h],
+                   [x, y + h]], dtype="float32")
     dst = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype="float32")
     M = cv2.getPerspectiveTransform(src, dst)
     return cv2.warpPerspective(img, M, (w, h))
 
-# ─── OCR and filter ───────────────────────────────────────────────────────
+# ─── OCR multipasso e upscaling ───────────────────────────────────────────
 
 
 def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float]:
-    raw = reader.readtext(crop, detail=1)
-    logger.debug(f"[ocr] raw={raw}")
-    cands: List[Tuple[str, float]] = []
+    """
+    Esegue OCR su crop, con upscaling e filtri.
+    Ritorna la miglior candidate e conf media.
+    """
+    # 1) upscaling
+    h, w = crop.shape[:2]
+    scaled = cv2.resize(crop, (w * UPSCALE_FACTOR, h *
+                        UPSCALE_FACTOR), interpolation=cv2.INTER_CUBIC)
+    gray_crop = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+    # 2) leggera sogliatura
+    _, thr = cv2.threshold(
+        gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 3) OCR
+    try:
+        raw = reader.readtext(thr, detail=1)
+    except Exception as e:
+        logger.error("[ocr] errore OCR: %s", e)
+        return None, 0.0
+    logger.debug(f"[ocr] raw results: {raw}")
+    candidates: List[Tuple[str, float]] = []
     for _, text, conf in raw:
         plate = re.sub(r'[^A-Za-z0-9]', '', text).upper()
         if ITALIAN_PLATE_REGEX.match(plate):
-            cands.append((plate, conf*100))
-    return max(cands, key=lambda x: x[1]) if cands else (None, 0.0)
+            candidates.append((plate, conf * 100))
+    if not candidates:
+        return None, 0.0
+    # 4) aggrega per stringa (se doppioni)
+    # prendi max conf
+    plate, conf = max(candidates, key=lambda x: x[1])
+    # se sotto soglia, considera None
+    if conf < MIN_CONFIDENCE:
+        return None, conf
+    return plate, conf
 
 # ─── Health-check ─────────────────────────────────────────────────────────
 
 
 @app.get("/", tags=["Health"])
-async def health(): return {"status": "ok"}
+async def health_check():
+    return {"status": "ok"}
 
-# ─── Main endpoint ────────────────────────────────────────────────────────
+# ─── Endpoint principale ───────────────────────────────────────────────────
 
 
 @app.post("/recognize", response_model=PlateResponse, tags=["ANPR"])
-async def recognize_plate(file: UploadFile = File(...)):
-    logger.info("[recognize] Received file: %s", file.filename)
+async def recognize_plate(file: UploadFile = File(..., description="JPEG/PNG image")):
+    logger.info("[recognize] ricezione file %s", file.filename)
     if file.content_type not in ("image/jpeg", "image/png"):
-        raise HTTPException(415, "Formato non supportato")
+        raise HTTPException(status_code=415, detail="Formato non supportato")
     data = await file.read()
-    frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise HTTPException(400, "Impossibile decodificare immagine")
-    vis, gray = preprocess_gray(frame)
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(
+            status_code=400, detail="Impossibile decodificare immagine")
+
+    # preprocessing e ricerca bounding box
+    vis, gray = preprocess_gray(img)
     rect = find_plate_region(gray)
     if not rect:
+        logger.info("[recognize] nessuna regione targa trovata")
         return {"plate": None, "confidence": 0.0, "box": None}
+
     x, y, w, h = rect
     crop = four_point_transform(vis, rect)
     plate, conf = ocr_plate(crop)
+    logger.info(f"[recognize] plate={plate} conf={conf:.1f}% box={rect}")
     return {"plate": plate, "confidence": round(conf, 1), "box": [x, y, w, h]}
 
 if __name__ == "__main__":
