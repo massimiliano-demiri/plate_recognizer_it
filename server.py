@@ -131,6 +131,9 @@ def find_plate_region(gray: np.ndarray, min_area: int = 1000, ar_range: Tuple[fl
 
 def four_point_transform(img: np.ndarray, rect: Tuple[int, int, int, int]) -> np.ndarray:
     x, y, w, h = rect
+    pad = int(0.1 * w)  # padding laterale 10%
+    x = max(0, x - pad)
+    w = min(img.shape[1] - x, w + 2 * pad)
     src = np.array([[x, y], [x + w, y], [x + w, y + h],
                    [x, y + h]], dtype="float32")
     dst = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype="float32")
