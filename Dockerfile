@@ -14,12 +14,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ─── PRE-DOWNLOAD DEL MODELLO EasyOCR ───────────────────────────────────────
-RUN python3 - <<EOF
-import easyocr
-# scarica e serializza il modello 'en' nella cache
-easyocr.Reader(['en'], gpu=False)
-EOF
+# PRE-DOWNLOAD DEL MODELLO EasyOCR
+COPY predownload.py ./
+RUN python3 predownload.py
 
 # Copia tutto il codice dell’app
 COPY . .
