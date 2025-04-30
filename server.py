@@ -84,9 +84,27 @@ def preprocess_gray(frame: np.ndarray, width: int = 640) -> Tuple[np.ndarray, np
     h, w = frame.shape[:2]
     scale = width / float(w)
     resized = cv2.resize(frame, (width, int(h * scale)))
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return resized, clahe.apply(gray)
+
+    # Denoising (meglio in condizioni notturne o rumorose)
+    denoised = cv2.fastNlMeansDenoisingColored(resized, None, 10, 10, 7, 21)
+
+    # Bilanciamento automatico del bianco
+    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    balanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+
+    # Correzione gamma per immagini troppo scure/chiare
+    gamma = 1.5  # più alta per schiarire
+    invGamma = 1.0 / gamma
+    table = np.array([(i / 255.0) ** invGamma *
+                     255 for i in np.arange(256)]).astype("uint8")
+    gamma_corrected = cv2.LUT(balanced, table)
+
+    gray = cv2.cvtColor(gamma_corrected, cv2.COLOR_BGR2GRAY)
+    return gamma_corrected, gray
 
 
 def find_plate_region(gray: np.ndarray, min_area: int = 1000, ar_range: Tuple[float, float] = (2.0, 8.0)) -> Optional[Tuple[int, int, int, int]]:
@@ -129,14 +147,25 @@ def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float, List[Dict[str, st
     scaled = cv2.resize(crop, (w * UPSCALE_FACTOR, h *
                         UPSCALE_FACTOR), interpolation=cv2.INTER_CUBIC)
     gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+
+    # Diverse versioni dell'immagine per OCR
     _, binarized = cv2.threshold(
         gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     inverted = cv2.bitwise_not(binarized)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
+    equalized = cv2.equalizeHist(gray)
+    light_mask = cv2.inRange(gray, 200, 255)
+    masked = cv2.bitwise_and(gray, gray, mask=light_mask)
 
-    inputs = [("binarized", binarized),
-              ("inverted", inverted), ("enhanced", enhanced)]
+    inputs = [
+        ("binarized", binarized),
+        ("inverted", inverted),
+        ("enhanced", enhanced),
+        ("equalized", equalized),
+        ("light_masked", masked)
+    ]
+
     candidates: List[Tuple[str, float]] = []
     attempts: List[Dict[str, str]] = []
 
@@ -148,8 +177,12 @@ def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float, List[Dict[str, st
                 plate = re.sub(r'[^A-Za-z0-9]', '', text).upper()
                 plate = normalize_plate(plate)
                 conf_pct = round(conf * 100, 1)
-                attempts.append(
-                    {"source": label, "raw": raw, "normalized": plate, "confidence": f"{conf_pct:.1f}%"})
+                attempts.append({
+                    "source": label,
+                    "raw": raw,
+                    "normalized": plate,
+                    "confidence": f"{conf_pct:.1f}%"
+                })
                 if ITALIAN_PLATE_REGEX.match(plate):
                     candidates.append((plate, conf_pct))
         except Exception as e:
