@@ -3,3 +3,4 @@ uvicorn[standard]
 easyocr
 opencv-python-headless
 numpy
+python-multipart
