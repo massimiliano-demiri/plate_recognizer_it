@@ -20,4 +20,4 @@ primary_region = 'fra'
   memory = '2gb'
   cpu_kind = 'shared'
   cpus = 2
-  memory_mb = 1024
+  memory_mb = 2048
