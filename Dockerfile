@@ -11,20 +11,20 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Installa dipendenze Python
-COPY requirements.txt .
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ─── PRE-DOWNLOAD DEL MODELLO EasyOCR ───────────────────────────────────────
-RUN python3 - << 'EOF'
+RUN python3 - <<EOF
 import easyocr
-# Scarica e serializza il modello 'en' nella cache di EasyOCR
+# scarica e serializza il modello 'en' nella cache
 easyocr.Reader(['en'], gpu=False)
 EOF
 
-# Copia il codice
+# Copia tutto il codice dell’app
 COPY . .
 
 EXPOSE 8000
 
-# Avvia il server
+# Avvia il server FastAPI
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
