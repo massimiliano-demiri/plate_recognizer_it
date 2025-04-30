@@ -34,12 +34,11 @@ logging.basicConfig(
 logger = logging.getLogger("anpr_server")
 
 # Regex per targhe italiane (AA123BB)
-ITALIAN_PLATE_REGEX = re.compile(
-    r"^[A-Z]{2}[0-9]{2,4}[A-Z]{1,3}$")  # estesa per tolleranza
+ITALIAN_PLATE_REGEX = re.compile(r"^[A-Z]{2}[0-9]{3}[A-Z]{2}$")
 
 # Configurazione OCR
 UPSCALE_FACTOR = 2
-MIN_CONFIDENCE = 25.0  # abbassata per maggiore tolleranza
+MIN_CONFIDENCE = 40.0
 
 # Response model
 
@@ -149,8 +148,8 @@ def ocr_plate(crop: np.ndarray) -> Tuple[Optional[str], float, List[Dict[str, st
                 plate = re.sub(r'[^A-Za-z0-9]', '', text).upper()
                 plate = normalize_plate(plate)
                 conf_pct = round(conf * 100, 1)
-                attempts.append({"source": label, "raw": raw, "normalized": plate,
-                                "confidence": f"{conf_pct:.1f}%", "valid": str(bool(ITALIAN_PLATE_REGEX.match(plate)))})
+                attempts.append(
+                    {"source": label, "raw": raw, "normalized": plate, "confidence": f"{conf_pct:.1f}%"})
                 if ITALIAN_PLATE_REGEX.match(plate):
                     candidates.append((plate, conf_pct))
         except Exception as e:
